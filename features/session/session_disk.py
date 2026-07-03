@@ -10,6 +10,7 @@ import glob
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from features.overview import draft_store as _ds
@@ -36,21 +37,46 @@ def _path(chat_id: str) -> str:
 
 
 @contextlib.contextmanager
-def exclusive_lock(chat_id: str) -> Iterator[None]:
-    """Serialize ``start_p0`` for one incident chat (cross-process)."""
+def exclusive_lock(chat_id: str, *, timeout_sec: float = 5.0) -> Iterator[bool]:
+    """Serialize ``start_p0`` for one incident chat (cross-process).
+
+    Yields ``True`` when the lock was acquired, ``False`` if it could not be acquired
+    within ``timeout_sec`` (another declare is already in progress for this chat).
+
+    NEVER blocks forever: a wedged holder must not be able to pin every future declare
+    for this chat. Callers should treat a ``False`` yield as "declare already running,
+    skip" rather than proceeding without the lock.
+    """
     chat_id = (chat_id or "").strip()
     if not enabled() or not _fcntl:
-        yield
+        yield True
         return
     path = _path(chat_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lock_path = path + ".lock"
     with open(lock_path, "a+", encoding="utf-8") as lf:
-        _fcntl.flock(lf, _fcntl.LOCK_EX)
+        acquired = False
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while True:
+            try:
+                _fcntl.flock(lf, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    log.warning(
+                        "session_disk: exclusive_lock timeout after %.1fs chat_tail=%s "
+                        "(another declare in progress or a stuck holder)",
+                        timeout_sec,
+                        chat_id[-12:] if len(chat_id) > 12 else chat_id,
+                    )
+                    break
+                time.sleep(0.1)
         try:
-            yield
+            yield acquired
         finally:
-            _fcntl.flock(lf, _fcntl.LOCK_UN)
+            if acquired:
+                _fcntl.flock(lf, _fcntl.LOCK_UN)
 
 
 def load_session(chat_id: str) -> Optional[Dict[str, Any]]:

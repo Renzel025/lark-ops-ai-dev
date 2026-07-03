@@ -77,6 +77,11 @@ _on_demand_timed_out_lock = threading.Lock()
 # Reuse Chromium between on-demand captures (avoids ~20–40s cold launch each time).
 _BROWSER_POOL_LOCK = threading.Lock()
 _BROWSER_POOL: Dict[str, Any] = {}
+# Set when a capture is abandoned on wall-clock timeout: the pooled Chromium may be
+# wedged and its Playwright objects belong to the (possibly stuck) worker thread, so we
+# must NOT reuse it and must NOT .stop() it cross-thread. The next acquire cold-starts a
+# fresh browser instead. Guarded by _BROWSER_POOL_LOCK.
+_pool_poisoned = False
 
 
 def _capture_ctx_set(
@@ -981,7 +986,10 @@ def _prepare_grafana_dashboard_for_capture(page, dashboard_url: str) -> None:
             try:
                 _preset_grafana_nav_local_storage(page)
                 log.info("p0 graph screenshot: force kiosk re-open (Grafana 11 dock hide)")
-                page.goto(u, wait_until="load", timeout=90_000)
+                # Bounded: was a hard-coded 90s. Cap at the configured nav timeout (default 60s)
+                # and never more than 45s so a slow kiosk reload can't stall a capture for 1.5 min.
+                kiosk_goto_ms = min(_config.get_p0_graph_screenshot_nav_timeout_ms(), 45_000)
+                page.goto(u, wait_until="load", timeout=kiosk_goto_ms)
                 page.wait_for_timeout(1200)
             except Exception as e:
                 log.warning("p0 graph screenshot: kiosk re-goto failed: %s", e)
@@ -2942,65 +2950,82 @@ def _capture_and_post_ranges_thread_body(
         _on_demand_timed_out = False
     with _capture_busy_lock:
         _capture_busy = True
-    _capture_ctx_set(
-        on_demand=on_demand,
-        force_full=False,
-        trigger_message_id=trigger_message_id,
-    )
-    completed = threading.Event()
-    watchdog: Optional[threading.Timer] = None
     max_sec = (
         _config.get_p0_graph_screenshot_on_demand_max_sec()
         if on_demand
         else _config.get_p0_graph_screenshot_auto_max_sec()
     )
+    # Run the capture in a JOIN-ABLE worker sub-thread. A synchronous Playwright call
+    # cannot be interrupted from another thread, so if the capture wedges we cannot cancel
+    # it — but we CAN stop waiting on it (join with a hard deadline) and poison the browser
+    # pool so the next capture cold-starts. Crucially _capture_busy is then released here
+    # UNCONDITIONALLY, so one wedged capture can never pin it True forever and silently
+    # skip every future capture (the previous watchdog Timer could not do this — it never
+    # released _capture_busy or interrupted the stuck call).
+    worker_error: Dict[str, str] = {}
 
-    def _capture_watchdog() -> None:
-        global _on_demand_timed_out
-        if completed.is_set():
-            return
-        with _on_demand_timed_out_lock:
-            _on_demand_timed_out = True
-        log.error(
-            "p0 graph screenshot: wall-clock timeout after %ss on_demand=%s chat_id_tail=%s",
-            max_sec,
-            on_demand,
-            chat_id[-12:] if chat_id else "",
+    def _capture_worker() -> None:
+        # _capture_ctx is thread-local — it MUST be set in the thread that runs the capture
+        # (this one), not the supervisor, or the capture would see an empty context.
+        _capture_ctx_set(
+            on_demand=on_demand,
+            force_full=False,
+            trigger_message_id=trigger_message_id,
         )
-        _post_capture_failure_to_chat(
-            token,
-            chat_id,
-            range_label=(range_keys or [""])[0] if range_keys else "",
-            reason=(
-                f"Timed out after {max_sec}s — Grafana/Playwright may be stuck. "
-                "Check journalctl -u lark-ops-ai."
-            ),
-        )
-        if on_demand:
-            _react_to_trigger_message(token, _config.get_p0_graph_screenshot_react_failed_emoji())
+        try:
+            _capture_and_post_ranges(token, chat_id, source_label, range_keys or [])
+        except Exception as e:
+            if not _on_demand_capture_timed_out():
+                _set_capture_error(str(e))
+                log.warning("p0 graph screenshot: ranges thread failed: %s", e, exc_info=True)
+                worker_error["reason"] = str(e)[:400]
+        finally:
+            _capture_ctx_clear()
 
-    watchdog = threading.Timer(float(max_sec), _capture_watchdog)
-    watchdog.daemon = True
-    watchdog.start()
+    worker = threading.Thread(
+        target=_capture_worker, name="p0-graph-screenshot-capture", daemon=True
+    )
+    worker.start()
+    worker.join(float(max_sec))
+    timed_out = worker.is_alive()
     try:
-        _capture_and_post_ranges(token, chat_id, source_label, range_keys or [])
-    except Exception as e:
-        if not _on_demand_capture_timed_out():
-            _set_capture_error(str(e))
-            log.warning("p0 graph screenshot: ranges thread failed: %s", e, exc_info=True)
+        if timed_out:
+            with _on_demand_timed_out_lock:
+                _on_demand_timed_out = True
+            log.error(
+                "p0 graph screenshot: wall-clock timeout after %ss on_demand=%s chat_id_tail=%s "
+                "— abandoning capture and poisoning the browser pool",
+                max_sec,
+                on_demand,
+                chat_id[-12:] if chat_id else "",
+            )
+            # Drop/poison the (possibly wedged) pooled browser so the NEXT capture cold-starts.
+            # We do NOT .stop() it here — those Playwright objects belong to the stuck worker.
+            try:
+                _browser_pool_poison()
+            except Exception as e:
+                log.warning("p0 graph screenshot: browser pool poison after timeout failed: %s", e)
             _post_capture_failure_to_chat(
                 token,
                 chat_id,
                 range_label=(range_keys or [""])[0] if range_keys else "",
-                reason=str(e)[:400],
+                reason=(
+                    f"Timed out after {max_sec}s — Grafana/Playwright was stuck; the capture "
+                    "was abandoned and the browser will be restarted. Check journalctl -u lark-ops-ai."
+                ),
+            )
+            if on_demand:
+                _react_to_trigger_message(token, _config.get_p0_graph_screenshot_react_failed_emoji())
+        elif worker_error.get("reason"):
+            _post_capture_failure_to_chat(
+                token,
+                chat_id,
+                range_label=(range_keys or [""])[0] if range_keys else "",
+                reason=worker_error["reason"],
             )
             if on_demand:
                 _react_to_trigger_message(token, _config.get_p0_graph_screenshot_react_failed_emoji())
     finally:
-        completed.set()
-        if watchdog:
-            watchdog.cancel()
-        _capture_ctx_clear()
         with _capture_busy_lock:
             _capture_busy = False
         # Drain queued on-demand jobs after any capture (auto/interval or on-demand).
@@ -3257,6 +3282,21 @@ def _browser_pool_close() -> None:
     _browser_pool_shutdown_state(st)
 
 
+def _browser_pool_poison() -> None:
+    """Mark the pooled Chromium unusable WITHOUT touching Playwright cross-thread.
+
+    Called from the capture supervisor when a capture is abandoned on timeout. The
+    wedged capture's ``pw``/``context``/``page`` are bound to its (possibly stuck) worker
+    thread; calling ``pw.stop()`` from here could itself hang. So we only drop the shared
+    references and raise a poison flag — the next ``_browser_pool_acquire`` cold-starts a
+    clean browser. The stuck worker/browser (if any) is a daemon and dies on process exit.
+    """
+    global _pool_poisoned
+    with _BROWSER_POOL_LOCK:
+        _BROWSER_POOL.clear()
+        _pool_poisoned = True
+
+
 def _browser_pool_acquire(
     *,
     user_data: str,
@@ -3276,22 +3316,30 @@ def _browser_pool_acquire(
     ):
         return None
     now = time.time()
+    global _pool_poisoned
     with _BROWSER_POOL_LOCK:
-        last = float(_BROWSER_POOL.get("last") or 0)
-        if _BROWSER_POOL.get("context") and now - last > _browser_pool_ttl_sec():
-            log.info("p0 graph screenshot pool: idle TTL expired — restarting browser")
-            st_old = dict(_BROWSER_POOL)
+        if _pool_poisoned:
+            # A prior capture timed out and may have left a wedged Chromium. Do NOT reuse
+            # or shut it down cross-thread — just drop the stale references and cold-start.
+            _pool_poisoned = False
             _BROWSER_POOL.clear()
-            _browser_pool_shutdown_state(st_old)
-        if _BROWSER_POOL.get("page") and _BROWSER_POOL.get("context"):
-            _BROWSER_POOL["last"] = now
-            log.info("p0 graph screenshot pool: reusing warm Chromium (skip cold launch)")
-            return (
-                _BROWSER_POOL.get("pw"),
-                _BROWSER_POOL.get("context"),
-                _BROWSER_POOL.get("page"),
-                True,
-            )
+            log.info("p0 graph screenshot pool: poisoned by a prior timeout — cold-starting a fresh browser")
+        else:
+            last = float(_BROWSER_POOL.get("last") or 0)
+            if _BROWSER_POOL.get("context") and now - last > _browser_pool_ttl_sec():
+                log.info("p0 graph screenshot pool: idle TTL expired — restarting browser")
+                st_old = dict(_BROWSER_POOL)
+                _BROWSER_POOL.clear()
+                _browser_pool_shutdown_state(st_old)
+            if _BROWSER_POOL.get("page") and _BROWSER_POOL.get("context"):
+                _BROWSER_POOL["last"] = now
+                log.info("p0 graph screenshot pool: reusing warm Chromium (skip cold launch)")
+                return (
+                    _BROWSER_POOL.get("pw"),
+                    _BROWSER_POOL.get("context"),
+                    _BROWSER_POOL.get("page"),
+                    True,
+                )
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -3324,12 +3372,16 @@ def _browser_pool_touch() -> None:
 def _capture_png_payloads(capture_url: Optional[str] = None) -> Tuple[List[bytes], str]:
     """
     Returns a non-empty list of PNG byte blobs and a formatted capture timestamp.
-    On-demand: retries once with full cold capture if the first attempt returns empty.
+    Retries once with a full cold capture if the first attempt returns empty — for both
+    on-demand (non-fast) and auto/interval captures. Fast on-demand keeps a single attempt.
     """
     if _is_on_demand_capture() and _effective_fast_capture():
+        # Fast on-demand: single attempt — a waiting user favors speed over a retry.
         attempts = 1
     else:
-        attempts = 2 if _is_on_demand_capture() else 1
+        # Non-fast on-demand AND auto/interval: one cold-restart retry on an empty result
+        # (blank/black panels or a transient nav failure).
+        attempts = 2
     for attempt in range(attempts):
         if attempt > 0:
             log.info("p0 graph screenshot: on-demand retry — full cold capture (attempt %s)", attempt + 1)

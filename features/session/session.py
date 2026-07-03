@@ -1722,7 +1722,12 @@ def start_p0(
     _clear_last_ended_snapshot(chat_id)
     # Bot warnings during start: same chat as meeting cards (incident vs mirror — see config).
     notify_chat = _config.get_session_meeting_card_post_chat_id(chat_id)
-    with _session_disk.exclusive_lock(chat_id):
+    with _session_disk.exclusive_lock(chat_id) as _lock_ok:
+        if not _lock_ok:
+            # Could not acquire within the bounded deadline — another declare is already
+            # in progress for this chat. Skip rather than proceed unlocked or double-declare.
+            log.info("start_p0: skipped — another declare already in progress for chat_id=%s", chat_id)
+            return
         if P0_SESSIONS.get(chat_id):
             if silent_when_blocked:
                 log.info("start_p0: blocked (session already active) silent chat_id=%s", chat_id)
@@ -1842,7 +1847,13 @@ def start_p0(
         if invite_mid:
             P0_SESSIONS[chat_id]["meeting_invite_message_id"] = invite_mid
             P0_SESSIONS[chat_id]["meeting_invite_notice_kind"] = "text_unfurl"
-        if priority == "P0":
+        if _session_disk.enabled():
+            _session_disk.save_session(chat_id, P0_SESSIONS[chat_id])
+    # Fan out the meeting-created notice to mirror groups OUTSIDE the exclusive lock —
+    # it posts to N chats (serial, bounded HTTP each) and does not gate the "session
+    # already active" decision, so it must not extend the per-chat lock hold.
+    if priority == "P0":
+        try:
             _fanout_p0_meeting_created_link_notice(
                 token,
                 chat_id,
@@ -1851,8 +1862,8 @@ def start_p0(
                 priority=priority,
                 emergency_topic=emergency_topic,
             )
-        if _session_disk.enabled():
-            _session_disk.save_session(chat_id, P0_SESSIONS[chat_id])
+        except Exception as e:
+            log.warning("start_p0: meeting-created fanout failed: %s", e)
     dm_targets = _dm_instruction_targets(trigger_open_id)
     log.info(
         "start_p0 DM targets count=%s open_ids=%s (API expects open_id ou_..., not user_id gceda344-style)",
@@ -1860,54 +1871,64 @@ def start_p0(
         [x for x in dm_targets if (x or "").strip()],
     )
     dm_targets_list = [x for x in dm_targets if (x or "").strip()]
-    # Run the Bitable adjustment notice FIRST, before scheduling the Grafana screenshot,
-    # so a slow/hung Grafana path can never delay the Bitable ops/deploy cards.
-    if priority == "P0":
-        try:
-            from features.overview import bitable_adjustments as _bitable_adj
+    issue_watch_key = (issue_watch_alert_key or "").strip()
+    # The two remaining SYNCHRONOUS pieces — the Bitable ops/deploy cards and the DM
+    # instruction/overview posts — only send messages, hold no lock, and their results
+    # are not consumed here. Run them OFF the declare thread so a slow Lark/Bitable call
+    # can never stall the declare. (Grafana + the schedulers below are already
+    # non-blocking — each spawns its own daemon thread.)
+    def _post_declare_finalize() -> None:
+        # Bitable ops/deploy cards — own per-session dedupe (_session_bitable_already_posted),
+        # no lock, result unused → safe to background.
+        if priority == "P0":
+            try:
+                from features.overview import bitable_adjustments as _bitable_adj
 
-            log.info("start_p0: running adjustment bitable on P0 declare chat_tail=%s", chat_id[-12:] if len(chat_id) > 12 else chat_id)
-            _bitable_adj.maybe_post_adjustment_notice_on_p0_declare(
-                token,
-                source_chat_id=chat_id,
-                priority=priority,
+                log.info("start_p0: running adjustment bitable on P0 declare chat_tail=%s", chat_id[-12:] if len(chat_id) > 12 else chat_id)
+                _bitable_adj.maybe_post_adjustment_notice_on_p0_declare(
+                    token,
+                    source_chat_id=chat_id,
+                    priority=priority,
+                )
+            except Exception as e:
+                log.warning("start_p0: adjustment bitable on declare failed: %s", e)
+        # Auto overview preview only when P0 is declared from Issue Watch DM (explicit alert_key).
+        # Typed p0 / thread confirm always get the green Build overview card.
+        if (
+            issue_watch_key
+            and priority == "P0"
+            and _config.get_p0_issue_watch_auto_overview_enabled()
+        ):
+            log.info(
+                "start_p0: Issue Watch suggested overview on declare chat_id=%s alert_key=%s",
+                chat_id[:24],
+                issue_watch_key[:12],
             )
-        except Exception as e:
-            log.warning("start_p0: adjustment bitable on declare failed: %s", e)
+        for oid in dm_targets:
+            if not oid:
+                continue
+            dm_item: Dict[str, Any] = {
+                "chat_id": chat_id,
+                "target_chat": target_chat,
+                "priority": priority,
+                "label": chat_label,
+            }
+            if oid == trigger_open_id and trigger_lark_user_id:
+                dm_item["operator_lark_user_id"] = trigger_lark_user_id
+            if issue_watch_key:
+                enqueue_dm_issue_watch_overview_if_needed(oid, token, dm_item, issue_watch_key)
+            else:
+                enqueue_dm_instruction_if_needed(oid, token, dm_item)
+
+    threading.Thread(
+        target=_post_declare_finalize, name="p0-declare-finalize", daemon=True
+    ).start()
     try:
         from features.screenshot.graph_screenshot import schedule_p0_graph_screenshot
 
         schedule_p0_graph_screenshot(token, priority, chat_label)
     except Exception as e:
         log.warning("start_p0: graph screenshot hook failed: %s", e)
-    # Auto overview preview only when P0 is declared from Issue Watch DM (explicit alert_key).
-    # Typed p0 / thread confirm always get the green Build overview card.
-    issue_watch_key = (issue_watch_alert_key or "").strip()
-    if (
-        issue_watch_key
-        and priority == "P0"
-        and _config.get_p0_issue_watch_auto_overview_enabled()
-    ):
-        log.info(
-            "start_p0: Issue Watch suggested overview on declare chat_id=%s alert_key=%s",
-            chat_id[:24],
-            issue_watch_key[:12],
-        )
-    for oid in dm_targets:
-        if not oid:
-            continue
-        dm_item: Dict[str, Any] = {
-            "chat_id": chat_id,
-            "target_chat": target_chat,
-            "priority": priority,
-            "label": chat_label,
-        }
-        if oid == trigger_open_id and trigger_lark_user_id:
-            dm_item["operator_lark_user_id"] = trigger_lark_user_id
-        if issue_watch_key:
-            enqueue_dm_issue_watch_overview_if_needed(oid, token, dm_item, issue_watch_key)
-        else:
-            enqueue_dm_instruction_if_needed(oid, token, dm_item)
     try:
         schedule_vc_auto_cancel_if_no_external_joins(chat_id)
     except Exception as e:

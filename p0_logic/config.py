@@ -1831,7 +1831,9 @@ def get_p0_graph_screenshot_wait_ms() -> int:
         n = int(raw)
     except Exception:
         n = 4000
-    return max(0, min(n, 120_000))
+    # Ceiling lowered 120s→30s: this is a fixed post-nav sleep; larger values only add
+    # dead wait per capture and were a runaway-latency source.
+    return max(0, min(n, 30_000))
 
 
 def get_p0_graph_screenshot_panel_ready_timeout_ms() -> int:
@@ -1847,7 +1849,8 @@ def get_p0_graph_screenshot_panel_ready_timeout_ms() -> int:
         n = int(raw)
     except Exception:
         n = 0
-    return max(0, min(n, 120_000))
+    # Ceiling lowered 120s→60s: recommended range is 20–35s; 60s is ample headroom.
+    return max(0, min(n, 60_000))
 
 
 def get_p0_graph_screenshot_panel_content_ready_timeout_ms() -> int:
@@ -1983,11 +1986,18 @@ def get_p0_graph_screenshot_goto_wait_until() -> str:
     - ``load`` (default): wait for load event — good when you want charts to start rendering; pair with a
       higher ``P0_GRAPH_SCREENSHOT_WAIT_MS`` for dense Grafana dashboards.
     - ``domcontentloaded``: earlier — page shell before many panel queries finish (lighter / “before graphs”).
-    - ``networkidle``: can hang on Grafana (WebSockets); avoid unless you know the site goes idle.
+    - ``networkidle``: NOT allowed — Grafana's live/streaming dashboards keep WebSockets/long-poll
+      open, so networkidle never settles and every ``goto`` blocks to the nav timeout. Coerced to ``load``.
     """
     reload_env_runtime()
     raw = (os.getenv("P0_GRAPH_SCREENSHOT_GOTO_WAIT_UNTIL") or "load").strip().lower()
-    allowed = frozenset(("load", "domcontentloaded", "networkidle", "commit"))
+    if raw == "networkidle":
+        log.warning(
+            "P0_GRAPH_SCREENSHOT_GOTO_WAIT_UNTIL=networkidle is unsafe on Grafana "
+            "(never settles → goto hangs to the nav timeout) — using load instead"
+        )
+        return "load"
+    allowed = frozenset(("load", "domcontentloaded", "commit"))
     if raw in allowed:
         return raw
     log.warning("P0_GRAPH_SCREENSHOT_GOTO_WAIT_UNTIL=%r invalid — using load", raw)
@@ -2161,25 +2171,27 @@ def get_p0_graph_screenshot_on_demand_band_stable_polls() -> int:
 
 
 def get_p0_graph_screenshot_on_demand_max_sec() -> int:
-    """Wall-clock cap for one on-demand capture; posts failure notice if exceeded. Default **360** (6 min)."""
+    """Enforced hard deadline for one on-demand capture; the capture is abandoned + failure posted if exceeded. Default **240** (4 min)."""
     reload_env_runtime()
-    raw = (os.getenv("P0_GRAPH_SCREENSHOT_ON_DEMAND_MAX_SEC") or "360").strip()
+    raw = (os.getenv("P0_GRAPH_SCREENSHOT_ON_DEMAND_MAX_SEC") or "240").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 240
+    # Ceiling lowered 900→480: past ~4 min a capture is almost certainly wedged, not slow.
+    return max(60, min(n, 480))
+
+
+def get_p0_graph_screenshot_auto_max_sec() -> int:
+    """Enforced hard deadline for auto P0-start / interval capture; the capture is abandoned + failure posted if exceeded. Default **360** (6 min)."""
+    reload_env_runtime()
+    raw = (os.getenv("P0_GRAPH_SCREENSHOT_AUTO_MAX_SEC") or "360").strip()
     try:
         n = int(raw)
     except ValueError:
         n = 360
-    return max(120, min(n, 900))
-
-
-def get_p0_graph_screenshot_auto_max_sec() -> int:
-    """Wall-clock cap for auto P0-start / interval capture; posts failure notice if exceeded. Default **600** (10 min)."""
-    reload_env_runtime()
-    raw = (os.getenv("P0_GRAPH_SCREENSHOT_AUTO_MAX_SEC") or "600").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 600
-    return max(180, min(n, 1200))
+    # Ceiling lowered 1200→600: bounds worst-case single capture to 10 min even if misconfigured.
+    return max(120, min(n, 600))
 
 
 def get_p0_graph_screenshot_band_panel_ready_ratio() -> float:
