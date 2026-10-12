@@ -4,16 +4,20 @@ When a P0 is declared by TYPING "p0" (not an Issue Watch alert, which is tied to
 concern), the auto-overview needs to know WHICH concern it is about — especially in a busy group where
 many issues were raised before the "p0". This resolves the concern text the overview is built from:
 
-  1. reply / thread  -> the parent (replied-to) message's text  — EXACT
+  1. reply / thread  -> the parent (replied-to) message's text  — EXACT (read back from Lark if not buffered)
   2. else, AI-pick    -> Claude chooses the concern among recent messages (P0_TYPED_DECLARE_CONCERN_AI_PICK)
   3. else, recent     -> the most recent substantive message before the "p0"
   4. else             -> the declaration text itself (unchanged)
+
+Whichever message is picked, if it is a thread reply its thread root's text is prepended — a reply like
+"can we consider this P0, more than 5 players" has no symptom; the thread's first message does.
 
 The buffer records every group message the bot already receives (no new Lark scope), keeping each
 message's ``parent_id``/``root_id`` so the reply anchor works without threading it through callers.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -114,6 +118,86 @@ def _row_by_id(cid: str, message_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _content_to_text(message_type: str, content: str) -> str:
+    """Plain text of a fetched ``text`` / ``post`` message body ('' for anything else)."""
+    try:
+        obj = json.loads(content or "{}")
+    except Exception:  # noqa: BLE001
+        return ""
+    if message_type == "text":
+        return str((obj or {}).get("text") or "").strip()
+    if message_type != "post":
+        return ""
+    parts: List[str] = []
+
+    def walk(v: Any) -> None:
+        if isinstance(v, dict):
+            if str(v.get("tag") or "").lower() == "text" and isinstance(v.get("text"), str):
+                parts.append(v["text"].strip())
+            for child in v.values():
+                walk(child)
+        elif isinstance(v, list):
+            for child in v:
+                walk(child)
+
+    # content_v2 duplicates content — walk only one of them.
+    walk((obj or {}).get("content") or obj)
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _message_text(cid: str, message_id: str) -> str:
+    """Text of ``message_id``: rolling buffer first, else read it back from Lark (older than the
+    buffer window, or sent before a restart). Only accepted if it belongs to ``cid``."""
+    mid = (message_id or "").strip()
+    if not mid:
+        return ""
+    hit = _text_by_id(cid, mid)
+    if hit:
+        return hit
+    try:
+        from p0_logic import lark_client as _lark
+
+        msg = _lark.get_im_message(_lark.get_tenant_token_primary(), mid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("concern_context: fetch message failed mid_tail=%s err=%s", mid[-12:], e)
+        return ""
+    if not msg or (msg.get("chat_id") and msg["chat_id"] != cid):
+        return ""
+    return _content_to_text(str(msg.get("message_type") or "").lower(), str(msg.get("content") or ""))
+
+
+def _thread_root_id(cid: str, row: Dict[str, Any]) -> str:
+    """Thread root of ``row``. A thread reply also shown in the main chat ("also send to chat") arrives
+    as two messages and only the in-thread copy carries root_id — fall back to a same-text row's."""
+    rid = str(row.get("root_id") or row.get("parent_id") or "").strip()
+    if rid:
+        return rid if rid != row.get("message_id") else ""
+    text = str(row.get("text") or "").strip()
+    for r in reversed(_rows(cid)):
+        if r is not row and str(r.get("text") or "").strip() == text:
+            rid = str(r.get("root_id") or r.get("parent_id") or "").strip()
+            if rid and rid != r.get("message_id"):
+                return rid
+    return ""
+
+
+def _with_thread_root(cid: str, row: Dict[str, Any]) -> str:
+    """The row's text, preceded by its thread root's text when the row is a thread reply.
+
+    A reply like "Can we consider this case as P0, more than 5 players" names no symptom — the
+    symptom is in the thread's first message, which is often older than the concern window.
+    """
+    text = str(row.get("text") or "").strip()
+    rid = _thread_root_id(cid, row)
+    if not rid:
+        return text
+    root = _message_text(cid, rid)
+    if not root or root == text or _is_bare_priority(root) or root in text:
+        return text
+    log.info("concern_context: prepended thread root to concern cid_tail=%s", cid[-8:])
+    return f"{root}\n\n{text}"
+
+
 def _is_bare_priority(text: str) -> bool:
     return bool(_BARE_P0_RE.match((text or "").strip()))
 
@@ -147,10 +231,10 @@ def _recent_concerns(cid: str, *, exclude_message_id: str = "") -> List[Dict[str
     return out[-limit:] if limit > 0 else out
 
 
-def _ai_pick_concern(decl_text: str, concerns: List[Dict[str, Any]]) -> str:
-    """Ask Claude which recent message is the concern being declared P0. Returns its text or ''."""
+def _ai_pick_concern(decl_text: str, concerns: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Ask Claude which recent message is the concern being declared P0. Returns its row or None."""
     if not concerns:
-        return ""
+        return None
     from p0_logic import anthropic_client as _anthropic
 
     numbered = "\n".join(f"[{i}] {str(c.get('text') or '')[:400]}" for i, c in enumerate(concerns))
@@ -169,18 +253,18 @@ def _ai_pick_concern(decl_text: str, concerns: List[Dict[str, Any]]) -> str:
         ans = (_anthropic.anthropic_chat_once(system, user, max_tokens=8) or "").strip()
     except Exception as e:  # noqa: BLE001
         log.warning("concern_context: AI-pick failed err=%s", e)
-        return ""
+        return None
     m = re.search(r"-?\d+", ans)
     if not m:
-        return ""
+        return None
     try:
         idx = int(m.group(0))
     except ValueError:
-        return ""
+        return None
     if 0 <= idx < len(concerns):
         log.info("concern_context: AI-pick chose [%s] of %s recent concern(s)", idx, len(concerns))
-        return str(concerns[idx].get("text") or "").strip()
-    return ""
+        return concerns[idx]
+    return None
 
 
 def _combine(concern: str, decl_text: str) -> str:
@@ -214,7 +298,7 @@ def resolve_declaration_concern(
     row = _row_by_id(cid, decl_message_id)
     if row:
         for pid in (str(row.get("parent_id") or ""), str(row.get("root_id") or "")):
-            ptext = _text_by_id(cid, pid)
+            ptext = _message_text(cid, pid)
             if not ptext or ptext == decl or _is_bare_priority(ptext):
                 continue
             # Duty usually declares by REPLYING to "is this not P0?" — the parent is then priority
@@ -227,7 +311,8 @@ def resolve_declaration_concern(
                 )
                 continue
             log.info("concern_context: resolved concern via reply-parent cid_tail=%s", cid[-8:])
-            return _combine(ptext, decl)
+            prow = _row_by_id(cid, pid) or {"message_id": pid, "text": ptext}
+            return _combine(_with_thread_root(cid, prow), decl)
 
     concerns = _recent_concerns(cid, exclude_message_id=decl_message_id)
     if not concerns:
@@ -237,8 +322,8 @@ def resolve_declaration_concern(
     if _config.get_p0_typed_declare_concern_ai_pick_enabled():
         picked = _ai_pick_concern(decl, concerns)
         if picked:
-            return _combine(picked, decl)
+            return _combine(_with_thread_root(cid, picked), decl)
 
     # 3. Most recent substantive message.
     log.info("concern_context: resolved concern via most-recent (of %s) cid_tail=%s", len(concerns), cid[-8:])
-    return _combine(str(concerns[-1].get("text") or ""), decl)
+    return _combine(_with_thread_root(cid, concerns[-1]), decl)

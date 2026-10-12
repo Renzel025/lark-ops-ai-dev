@@ -254,9 +254,11 @@ def _impact_from_bare_count_lines(text: str) -> Optional[str]:
 
 def build_impact_scope(text: str) -> str:
     ids = extract_player_ids(text)
-    if ids:
+    n, label = extract_player_count_from_text(text)
+    # A thread's first report lists 2 IDs, a later reply says "more than 5 players" — the stated
+    # count is the newer, larger picture, so it wins over the ID tally.
+    if ids and not (n and label and n > len(ids)):
         return f"{len(ids)} affected players"
-    _n, label = extract_player_count_from_text(text)
     if label:
         return label
     bare_line = _impact_from_bare_count_lines(text)

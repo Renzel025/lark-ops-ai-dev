@@ -1006,7 +1006,8 @@ def process_message(
 
         # Buffer the message so a typed "p0" can later resolve WHICH concern to build the overview from
         # (reply-parent / AI-pick / most-recent). Cheap; records into the incident group's rolling buffer.
-        if is_detection and message_type == "text":
+        # "post" too: real concern reports are usually rich text (text + screenshots), not plain text.
+        if is_detection and message_type in ("text", "post"):
             try:
                 from features.overview import concern_context as _concern_ctx
 
