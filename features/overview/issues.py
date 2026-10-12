@@ -57,7 +57,7 @@ def summarize_issue(text: str) -> str:
     src = (text or "").strip()
     if not src:
         return "Not specified"
-    best_issue_text = _text._pick_best_issue_text(src) or src
+    best_issue_text = _text.issue_context_for_model(src) or src
     scrubbed = re.sub(r"\[Screenshot\s+\d+\s+OCR\]", " ", best_issue_text, flags=re.IGNORECASE)
     scrubbed = re.sub(r"\b\d{6,}\b", "<ID>", scrubbed)
     scrubbed = re.sub(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", "<DATE>", scrubbed)
@@ -69,9 +69,10 @@ def summarize_issue(text: str) -> str:
         "Write ONE concise factual issue sentence for a P0/P1 overview.\n"
         "STRICT RULES:\n"
         "- Use only the provided text.\n"
-        "- Focus only on the actual incident symptom or user-facing problem.\n"
+        "- State directly WHAT is broken: the specific game / provider / feature / page and the failure; "
+        "include the cause if the text states one.\n"
         "- Ignore names, @mentions, chat headers, screenshot labels, ticket references, and unrelated thread noise.\n"
-        "- Do NOT include counts unless essential to the symptom.\n"
+        "- Do NOT describe impact (how many players are affected/reporting) — that is a separate field.\n"
         "- Do NOT include player IDs, account IDs, or ticket IDs.\n"
         "- Do NOT include dates or previous incident references.\n"
         "- Do NOT invent anything.\n"

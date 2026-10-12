@@ -436,7 +436,7 @@ def _scrub_issue_source_for_model(issue_source: str) -> str:
     src = (issue_source or "").strip()
     if not src:
         return ""
-    best = _text._pick_best_issue_text(src) or src
+    best = _text.issue_context_for_model(src) or src
     scrubbed = re.sub(r"\[Screenshot\s+\d+\s+OCR\]", " ", best, flags=re.IGNORECASE)
     scrubbed = re.sub(r"\b\d{6,}\b", "<ID>", scrubbed)
     scrubbed = re.sub(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", "<DATE>", scrubbed)
@@ -457,8 +457,17 @@ def build_overview_oneshot_prompts(issue_source: str, impact_en: str) -> Optiona
     system_prompt = (
         "You are an on-call incident assistant.\n"
         "Output ONLY valid JSON (no markdown fences, no commentary). Keys: issue_en, zh_issue, zh_impact\n"
-        "- issue_en: ONE concise English sentence for the user-facing incident symptom. "
-        "Use only the incident text. No player IDs, ticket IDs, dates, or @names. No bullets.\n"
+        "- issue_en: ONE short, direct English sentence stating WHAT is broken: name the specific "
+        "game / provider / feature / page / payment method and the failure (error message, stuck, "
+        "cannot log in, missing balance, …). If the text states a cause, include it. "
+        "Lead with the broken thing — no filler like 'There is an issue where'.\n"
+        "  Do NOT describe impact: never write how many players are affected or reporting, "
+        "'multiple players are affected', or similar — impact scope is a separate field. "
+        "Ignore player-count sentences when writing issue_en.\n"
+        "  Good: 'Players cannot launch PG Soft games — stuck on loading screen.' "
+        "Good: 'GCash deposits fail with transaction timeout after payment gateway change.' "
+        "Bad: 'Multiple players are affected by this issue, with more than 5 players reporting the problem.'\n"
+        "  Use only the incident text. No player IDs, ticket IDs, dates, or @names. No bullets.\n"
         "- zh_issue: ONE line Simplified Chinese: translate issue_en faithfully.\n"
         "- zh_impact: ONE line Simplified Chinese: translate the impact scope English line given below. "
         'If that line is "Not specified" or empty, set zh_impact to 未指定.\n'

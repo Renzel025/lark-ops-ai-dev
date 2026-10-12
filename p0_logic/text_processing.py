@@ -225,6 +225,21 @@ def _pick_best_issue_text(text: str) -> str:
     return max(blocks, key=_score_issue_block)
 
 
+def issue_context_for_model(text: str, max_chars: int = 2500) -> str:
+    """
+    Incident text for the issue-summary LLM: every non-noise paragraph, best-scored first.
+    Picking only the single best block lost the actual symptom whenever an impact-only paragraph
+    ("more than 5 players reporting the problem") out-scored it — the model then summarized the impact.
+    """
+    src = (text or "").strip()
+    if not src:
+        return ""
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", src) if b.strip()]
+    kept = [b for b in blocks if _score_issue_block(b) >= 0] or blocks
+    kept.sort(key=_score_issue_block, reverse=True)
+    return "\n\n".join(kept)[:max_chars]
+
+
 def _impact_from_bare_count_lines(text: str) -> Optional[str]:
     """Detect lines that are only a player count (common when ops pastes a short note)."""
     src = (text or "").strip()
