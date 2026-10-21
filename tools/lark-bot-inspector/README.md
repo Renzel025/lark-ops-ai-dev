@@ -37,6 +37,31 @@ Claude Code ──stdio──▶ server.py (local, .venv) ──ssh──▶ bot
 
 4. Output (stdout + stderr, capped at 20 000 chars) goes back to Claude.
 
+### How Claude Code picks up `.mcp.json`
+
+This happens once, at session start:
+
+1. **Find** — Claude Code looks for `.mcp.json` at the root of the opened project
+   (`lark-ops-ai-dev/`). Servers defined there are **project-scoped**: committed to git, shared with
+   everyone who clones the repo.
+2. **Approval check** — a committed file could make your machine run any command, so project
+   servers never start automatically. Claude Code checks your local settings:
+   - in `enabledMcpjsonServers`, or `enableAllProjectMcpServers: true` → allowed
+   - in `disabledMcpjsonServers` (`.claude/settings.local.json`) → blocked
+   - in neither → it asks at startup and saves your answer to one of those lists
+3. **Launch** — it runs the `command` + `args` from `.mcp.json`
+   (`tools/lark-bot-inspector/.venv/bin/python tools/lark-bot-inspector/server.py`), started from
+   the project folder — which is why the relative paths work and `.venv` must be at that exact spot.
+4. **Handshake over stdio** — Claude Code sends the MCP `initialize` request; `server.py`
+   (`mcp.run()`) replies with its name and `instructions`. Claude Code then asks for the tool
+   list and gets the 8 `@mcp.tool()` functions with their descriptions and parameters.
+5. **Tools available** — they appear as `mcp__lark-bot-inspector__check_logs` etc., and `/mcp`
+   shows the server as connected. If any step fails (missing `.venv`, Python error, bad JSON),
+   `/mcp` shows it as failed and no tools appear.
+
+Because this only runs at session start, **any change** — editing `.mcp.json` or `server.py`, or
+re-enabling the server — needs a Claude Code restart.
+
 ---
 
 ## Setup from zero
